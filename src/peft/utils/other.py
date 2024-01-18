@@ -22,12 +22,13 @@ import torch
 from accelerate.hooks import add_hook_to_module, remove_hook_from_module
 from accelerate.utils import is_npu_available, is_xpu_available
 from safetensors.torch import storage_ptr, storage_size
+from transformers.integrations import is_deepspeed_zero3_enabled
 
 from ..import_utils import is_auto_gptq_available, is_torch_tpu_available
 from .constants import (
+    COMMON_LAYERS_PATTERN,
     CONFIG_NAME,
     EMBEDDING_LAYER_NAMES,
-    INCLUDE_LINEAR_LAYERS_SHORTHAND,
     SAFETENSORS_WEIGHTS_NAME,
     TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING,
@@ -41,6 +42,7 @@ from .constants import (
 
 
 __all__ = [
+    "COMMON_LAYERS_PATTERN",
     "CONFIG_NAME",
     "EMBEDDING_LAYER_NAMES",
     "SAFETENSORS_WEIGHTS_NAME",
@@ -50,7 +52,6 @@ __all__ = [
     "TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING",
     "WEIGHTS_NAME",
-    "INCLUDE_LINEAR_LAYERS_SHORTHAND",
     "bloom_model_postprocess_past_key_value",
     "starcoder_model_postprocess_past_key_value",
 ]
@@ -60,8 +61,6 @@ __all__ = [
 def infer_device():
     if torch.cuda.is_available():
         torch_device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch_device = torch.device("mps")
     elif is_xpu_available():
         torch_device = "xpu"
     elif is_npu_available():
@@ -188,14 +187,24 @@ class ModulesToSaveWrapper(torch.nn.Module):
         # use a property to ensure that active_adapter is not set directly, instead use the set_adapter method
         return self._active_adapter
 
-    @property
-    def weight(self):
-        if self.active_adapter not in self.modules_to_save:
-            return self.original_module.weight
-        return self.modules_to_save[self.active_adapter].weight
-
     def update(self, adapter_name):
-        self.modules_to_save.update(torch.nn.ModuleDict({adapter_name: copy.deepcopy(self.original_module)}))
+        if is_deepspeed_zero3_enabled():
+            # a check: if adapter_name is already in self.modules_to_save: do nothing, otherwise we lose the deepspeed state
+            if adapter_name not in self.modules_to_save.keys():
+                import deepspeed
+                params = [self.original_module.weight]
+                if getattr(self.original_module, "bias", None) is not None:
+                    params.append(self.original_module.bias)
+                with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+                    original_module = copy.deepcopy(self.original_module)
+                # do a swap, so the adapter profile has the deepspeed state why the original_module has not deepspeed state
+                ds_module = self.original_module
+                self.original_module = original_module
+                self.modules_to_save.update(torch.nn.ModuleDict({adapter_name: ds_module}))
+            elif adapter_name != self.active_adapter:
+                raise RuntimeError(f"{adapter_name} is not the active adapter: {self.active_adapter}. Using deepspeed with LoRA only supports one adapter.")
+        else:
+            self.modules_to_save.update(torch.nn.ModuleDict({adapter_name: copy.deepcopy(self.original_module)}))
 
         if hasattr(self.modules_to_save[adapter_name], "_hf_hook"):
             old_hook = self.modules_to_save[adapter_name]._hf_hook
@@ -360,20 +369,6 @@ def fsdp_auto_wrap_policy(model):
 
     from ..tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 
-    default_transformer_cls_names_to_wrap = (
-        ",".join(model._no_split_modules) if getattr(model, "_no_split_modules", None) is not None else ""
-    )
-    transformer_cls_names_to_wrap = os.environ.get(
-        "FSDP_TRANSFORMER_CLS_TO_WRAP", default_transformer_cls_names_to_wrap
-    ).split(",")
-    transformer_cls_to_wrap = {PrefixEncoder, PromptEncoder, PromptEmbedding}
-    for layer_class in transformer_cls_names_to_wrap:
-        transformer_cls = FullyShardedDataParallelPlugin.get_module_class_from_name(model, layer_class)
-        if transformer_cls is None:
-            raise Exception("Could not find the transformer layer class to wrap in the model.")
-        else:
-            transformer_cls_to_wrap.add(transformer_cls)
-
     def lambda_policy_fn(module):
         if (
             len(list(module.named_children())) == 0
@@ -386,7 +381,14 @@ def fsdp_auto_wrap_policy(model):
     lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
     transformer_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls=transformer_cls_to_wrap,
+        transformer_layer_cls=(
+            PrefixEncoder,
+            PromptEncoder,
+            PromptEmbedding,
+            FullyShardedDataParallelPlugin.get_module_class_from_name(
+                model, os.environ.get("FSDP_TRANSFORMER_CLS_TO_WRAP", "")
+            ),
+        ),
     )
 
     auto_wrap_policy = functools.partial(_or_policy, policies=[lambda_policy, transformer_wrap_policy])
@@ -497,24 +499,23 @@ def id_tensor_storage(tensor: torch.Tensor) -> Tuple[torch.device, int, int]:
 
     return tensor.device, unique_id, storage_size(tensor)
 
+from transformers.integrations import is_deepspeed_zero3_enabled, deepspeed_config
 
-def cast_mixed_precision_params(model, dtype):
-    """
-    Cast all non-trainable parameters of the model to the given `dtype`. The `dtype` can be `torch.float16` or
-    `torch.bfloat16` as per the mixed-precision training you are performing. The trainable parameters are cast to full
-    precision. This is meant to reduce the GPU memory usage when using PEFT methods by using half-precision dtype for
-    non-trainable parameters. Having the trainable parameters in full-precision preserves training stability when using
-    automatic mixed-precision training.
+def get_model_init_context():
+    if is_deepspeed_zero3_enabled():
+        import deepspeed
+        ctx_manager = deepspeed.zero.Init(config_dict_or_path=deepspeed_config())
+    else:
+        import contextlib
+        ctx_manager = contextlib.nullcontext()
+    return ctx_manager
 
-    Args:
-        model (`torch.nn.Module`):
-            The model to cast the non-trainable parameters of.
-        dtype (`torch.dtype`):
-            The dtype to cast the non-trainable parameters to. The `dtype` can be `torch.float16` or
-    `torch.bfloat16` as per the mixed-precision training you are performing.
-    """
-    for p in model.parameters():
-        if not p.requires_grad:
-            p.data = p.to(dtype)
-        else:
-            p.data = p.to(torch.float32)
+
+def get_deepspeed_gathered_params_context(params=None, modifier_rank=0):
+    if is_deepspeed_zero3_enabled() and params is not None:
+        import deepspeed
+        ctx_manager = deepspeed.zero.GatheredParameters(params, modifier_rank=modifier_rank)
+    else:
+        import contextlib
+        ctx_manager = contextlib.nullcontext()
+    return ctx_manager

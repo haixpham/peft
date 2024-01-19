@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.7.2.dev0"
+__version__ = "0.7.1"
 
 from .auto import (
     AutoPeftModel,
@@ -71,8 +71,6 @@ from .tuners import (
     MultitaskPromptTuningInit,
     OFTConfig,
     OFTModel,
-    PolyConfig,
-    PolyModel,
 )
 from .utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
@@ -85,6 +83,5 @@ from .utils import (
     set_peft_model_state_dict,
     shift_tokens_right,
     load_peft_weights,
-    cast_mixed_precision_params,
 )
 from .config import PeftConfig, PromptLearningConfig

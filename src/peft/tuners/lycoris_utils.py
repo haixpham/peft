@@ -225,6 +225,7 @@ class LycorisTuner(BaseTuner):
         target_name,
         parent,
         current_key,
+        **optional_kwargs,
     ):
         ...
 

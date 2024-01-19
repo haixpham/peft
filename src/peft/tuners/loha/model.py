@@ -95,6 +95,7 @@ class LoHaModel(LycorisTuner):
         target_name: str,
         parent: nn.Module,
         current_key: str,
+        **optional_kwargs,
     ) -> None:
         """
         A private method to create and replace the target module with the adapter module.
